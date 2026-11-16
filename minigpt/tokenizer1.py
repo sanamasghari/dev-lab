@@ -14,8 +14,7 @@ class CharTokenizer:
         Returns:
             List[int]: List of character integer codes.
         """
-        # TODO: Map each character in the string to its integer character code representation
-        raise NotImplementedError("Implement this method")
+        return [ord(ch) for ch in text]
 
     def decode(self, tokens: List[int]) -> str:
         """Convert a list of integer character codes back into a string.
@@ -26,8 +25,7 @@ class CharTokenizer:
         Returns:
             str: Decoded text string.
         """
-        # TODO: Map each integer code back to its corresponding character and combine them
-        raise NotImplementedError("Implement this method")
+        return "".join(chr(t) for t in tokens)
 
 
 class BPETokenizer:
@@ -47,8 +45,7 @@ class BPETokenizer:
         Returns:
             Counter: Mapping of (token_a, token_b) tuples to their occurrence counts.
         """
-        # TODO: Count frequency of adjacent pairs across the token sequence
-        raise NotImplementedError("Implement this method")
+        return Counter(zip(tokens, tokens[1:]))
 
     def _merge_pair(
         self, tokens: List[int], pair: Tuple[int, int], new_token: int
@@ -63,8 +60,18 @@ class BPETokenizer:
         Returns:
             List[int]: Updated sequence with non-overlapping target pair merged.
         """
-        # TODO: Iterate through sequence and substitute target pair occurrences with new token without overlapping
-        raise NotImplementedError("Implement this method")
+        merged: List[int] = []
+        i = 0
+        n = len(tokens)
+        p0, p1 = pair
+        while i < n:
+            if i < n - 1 and tokens[i] == p0 and tokens[i + 1] == p1:
+                merged.append(new_token)
+                i += 2
+            else:
+                merged.append(tokens[i])
+                i += 1
+        return merged
 
     def train(self, text: str, num_merges: int) -> "BPETokenizer":
         """Train BPE vocabulary starting from 256 base bytes and learn merge rules from text.
@@ -76,8 +83,21 @@ class BPETokenizer:
         Returns:
             BPETokenizer: Self instance after training.
         """
-        # TODO: Initialize 256 base byte tokens in vocab, compute pair frequencies, and iteratively merge top pair
-        raise NotImplementedError("Implement this method")
+        self.vocab = {i: bytes([i]) for i in range(256)}
+        self.merges = {}
+        tokens = list(text.encode("utf-8"))
+
+        for i in range(num_merges):
+            pairs = self._get_pairs(tokens)
+            if not pairs:
+                break
+            best_pair = max(pairs, key=lambda p: pairs[p])
+            new_id = 256 + i
+            self.merges[best_pair] = new_id
+            self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
+            tokens = self._merge_pair(tokens, best_pair, new_id)
+
+        return self
 
     def encode(self, text: str) -> List[int]:
         """Encode string text into BPE token IDs using learned merge rules.
@@ -88,8 +108,10 @@ class BPETokenizer:
         Returns:
             List[int]: Encoded list of BPE token IDs.
         """
-        # TODO: Convert text into raw UTF-8 bytes and iteratively apply learned merge rules in order
-        raise NotImplementedError("Implement this method")
+        tokens = list(text.encode("utf-8"))
+        for pair, new_id in self.merges.items():
+            tokens = self._merge_pair(tokens, pair, new_id)
+        return tokens
 
     def decode(self, tokens: List[int]) -> str:
         """Decode a list of BPE token IDs back into a text string.
@@ -100,8 +122,12 @@ class BPETokenizer:
         Returns:
             str: Reconstructed text string.
         """
-        # TODO: Lookup byte sequences for tokens, concatenate them, and decode UTF-8 bytes into text
-        raise NotImplementedError("Implement this method")
+        if not self.vocab:
+            self.vocab = {i: bytes([i]) for i in range(256)}
+        byte_seq = b"".join(
+            self.vocab.get(t, bytes([t]) if 0 <= t < 256 else b"") for t in tokens
+        )
+        return byte_seq.decode("utf-8", errors="replace")
 
     def vocab_size(self) -> int:
         """Get current vocabulary size.
@@ -109,8 +135,7 @@ class BPETokenizer:
         Returns:
             int: Total number of unique tokens in the vocabulary.
         """
-        # TODO: Return total number of items in vocabulary
-        raise NotImplementedError("Implement this method")
+        return len(self.vocab)
 
     def token_to_str(self, token_id: int) -> str:
         """Convert a single token ID into its string representation for visualization.
@@ -121,8 +146,9 @@ class BPETokenizer:
         Returns:
             str: String representation of the token bytes.
         """
-        # TODO: Fetch byte mapping for token ID and decode into printable string format
-        raise NotImplementedError("Implement this method")
+        if token_id in self.vocab:
+            return self.vocab[token_id].decode("utf-8", errors="replace")
+        return f"<unk:{token_id}>"
 
 
 def compression_ratio(tokenizer: Any, text: str) -> float:
@@ -137,8 +163,11 @@ def compression_ratio(tokenizer: Any, text: str) -> float:
     Returns:
         float: Ratio of encoded token count to raw byte length (0.0 if empty).
     """
-    # TODO: Calculate encoded token count relative to raw UTF-8 byte length, returning 0.0 for empty input
-    raise NotImplementedError("Implement this method")
+    raw_bytes = len(text.encode("utf-8"))
+    if raw_bytes == 0:
+        return 0.0
+    tokens = tokenizer.encode(text)
+    return float(len(tokens)) / raw_bytes
 
 
 def vocabulary_stats(tokenizer: Any, texts: List[str]) -> None:
@@ -151,8 +180,27 @@ def vocabulary_stats(tokenizer: Any, texts: List[str]) -> None:
     Returns:
         None
     """
-    # TODO: Compute token frequency metrics, average token lengths per word, and output summary stats
-    pass
+    token_counts: Counter = Counter()
+    total_tokens = 0
+    total_words = 0
+
+    for text in texts:
+        tokens = tokenizer.encode(text)
+        token_counts.update(tokens)
+        total_tokens += len(tokens)
+        total_words += len(text.split())
+
+    v_size = tokenizer.vocab_size() if hasattr(tokenizer, "vocab_size") else 0
+    unique_used = len(token_counts)
+    avg_tokens_per_word = total_tokens / max(total_words, 1)
+
+    print(f"  Total tokens across texts: {total_tokens}")
+    print(f"  Unique tokens used: {unique_used} / {v_size}")
+    print(f"  Average tokens per word: {avg_tokens_per_word:.2f}")
+    print("  Top 10 most frequent tokens:")
+    for tok_id, count in token_counts.most_common(10):
+        tok_str = tokenizer.token_to_str(tok_id)
+        print(f"    ID {tok_id:4d} ({repr(tok_str)}): {count}")
 
 
 # [KEEP_IMPLEMENTATION]

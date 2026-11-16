@@ -24,8 +24,9 @@ def pre_tokenize(text: str) -> List[str]:
     Returns:
         List[str]: A list of string chunks matched by the pre-tokenization regex.
     """
-    # TODO: Apply GPT2_PATTERN regex iterator over text to extract all chunk string matches
-    raise NotImplementedError("Implement this method")
+    if not text:
+        return []
+    return [match.group(0) for match in GPT2_PATTERN.finditer(text)]
 
 
 def apply_merge(byte_seq: List[int], pair: Tuple[int, int], new_id: int) -> List[int]:
@@ -40,8 +41,18 @@ def apply_merge(byte_seq: List[int], pair: Tuple[int, int], new_id: int) -> List
     Returns:
         List[int]: A new list of token IDs with target pairs merged.
     """
-    # TODO: Iterate through byte_seq, find adjacent matching pairs, and replace them with new_id
-    raise NotImplementedError("Implement this method")
+    merged: List[int] = []
+    i = 0
+    n = len(byte_seq)
+    p0, p1 = pair
+    while i < n:
+        if i < n - 1 and byte_seq[i] == p0 and byte_seq[i + 1] == p1:
+            merged.append(new_id)
+            i += 2
+        else:
+            merged.append(byte_seq[i])
+            i += 1
+    return merged
 
 
 class SpecialTokenHandler:
@@ -65,8 +76,13 @@ class SpecialTokenHandler:
         Returns:
             None
         """
-        # TODO: Store the token ID mapping and update the compiled regex pattern using re.escape
-        pass
+        self.special_tokens[token_str] = token_id
+        # Sort by length descending so longer overlapping special tokens match first
+        escaped = [
+            re.escape(k)
+            for k in sorted(self.special_tokens.keys(), key=len, reverse=True)
+        ]
+        self.pattern = re.compile("(" + "|".join(escaped) + ")")
 
     def split_with_specials(self, text: str) -> List[Tuple[str, bool]]:
         """
@@ -78,8 +94,19 @@ class SpecialTokenHandler:
         Returns:
             List[Tuple[str, bool]]: A list of tuples where each tuple is (substring, is_special_flag).
         """
-        # TODO: Search text using pattern, split into standard text vs special token parts, and tag each part
-        raise NotImplementedError("Implement this method")
+        if not text:
+            return []
+        if self.pattern is None or not self.special_tokens:
+            return [(text, False)]
+
+        parts = self.pattern.split(text)
+        result: List[Tuple[str, bool]] = []
+        for part in parts:
+            if not part:
+                continue
+            is_special = part in self.special_tokens
+            result.append((part, is_special))
+        return result
 
 
 class ProductionTokenizer:
@@ -104,8 +131,7 @@ class ProductionTokenizer:
         Returns:
             str: Unicode normalized string.
         """
-        # TODO: Normalize input text using unicodedata NFKC standard
-        raise NotImplementedError("Implement this method")
+        return unicodedata.normalize("NFKC", text)
 
     def train(self, text: str, num_merges: int) -> None:
         """
@@ -118,11 +144,29 @@ class ProductionTokenizer:
         Returns:
             None
         """
-        # TODO: Normalize and pre-tokenize corpus text into byte sequences
-        # TODO: Iteratively count adjacent pair frequencies across all chunk byte sequences
-        # TODO: Find the most frequent pair, create a new vocabulary entry, and record the merge rule
-        # TODO: Replace the best pair in all chunk sequences using apply_merge
-        pass
+        if not text or num_merges <= 0:
+            return
+
+        norm_text = self.normalize(text)
+        chunks = pre_tokenize(norm_text)
+        chunk_seqs: List[List[int]] = [list(chunk.encode("utf-8")) for chunk in chunks]
+
+        for _ in range(num_merges):
+            pair_counts: Counter = Counter()
+            for seq in chunk_seqs:
+                if len(seq) >= 2:
+                    pair_counts.update(zip(seq, seq[1:]))
+
+            if not pair_counts:
+                break
+
+            best_pair = max(pair_counts, key=lambda p: pair_counts[p])
+            new_id = self.next_id
+            self.next_id += 1
+
+            self.merges[best_pair] = new_id
+            self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
+            chunk_seqs = [apply_merge(seq, best_pair, new_id) for seq in chunk_seqs]
 
     def add_special_token(self, token_str: str) -> int:
         """
@@ -134,8 +178,14 @@ class ProductionTokenizer:
         Returns:
             int: Assigned vocabulary integer ID for the special token.
         """
-        # TODO: Allocate new_id, register special token with special_handler and add byte representation to vocab
-        raise NotImplementedError("Implement this method")
+        if token_str in self.special_handler.special_tokens:
+            return self.special_handler.special_tokens[token_str]
+
+        token_id = self.next_id
+        self.next_id += 1
+        self.special_handler.add_token(token_str, token_id)
+        self.vocab[token_id] = token_str.encode("utf-8")
+        return token_id
 
     def encode(self, text: str) -> List[int]:
         """
@@ -147,10 +197,27 @@ class ProductionTokenizer:
         Returns:
             List[int]: List of encoded vocabulary token IDs.
         """
-        # TODO: Normalize input text and split into standard text and special token segments
-        # TODO: For standard text segments, apply pre-tokenization and convert chunks into byte sequences
-        # TODO: Apply learned BPE merges sequentially to byte sequences and collect all output token IDs
-        raise NotImplementedError("Implement this method")
+        if not text:
+            return []
+
+        segments = self.special_handler.split_with_specials(text)
+        output_ids: List[int] = []
+
+        for segment, is_special in segments:
+            if is_special:
+                output_ids.append(self.special_handler.special_tokens[segment])
+            else:
+                norm_seg = self.normalize(segment)
+                chunks = pre_tokenize(norm_seg)
+                for chunk in chunks:
+                    seq = list(chunk.encode("utf-8"))
+                    for pair, new_id in self.merges.items():
+                        if len(seq) < 2:
+                            break
+                        seq = apply_merge(seq, pair, new_id)
+                    output_ids.extend(seq)
+
+        return output_ids
 
     def decode(self, ids: List[int]) -> str:
         """
@@ -162,8 +229,8 @@ class ProductionTokenizer:
         Returns:
             str: Decoded UTF-8 text string.
         """
-        # TODO: Map token IDs back to byte representations using vocabulary and decode as UTF-8
-        raise NotImplementedError("Implement this method")
+        raw_bytes = b"".join(self.get_token_bytes(tid) for tid in ids)
+        return raw_bytes.decode("utf-8", errors="replace")
 
     def vocab_size(self) -> int:
         """
@@ -172,8 +239,7 @@ class ProductionTokenizer:
         Returns:
             int: Number of total entries in vocabulary.
         """
-        # TODO: Return total number of vocabulary items
-        raise NotImplementedError("Implement this method")
+        return len(self.vocab)
 
     def get_token_bytes(self, token_id: int) -> bytes:
         """
@@ -185,8 +251,7 @@ class ProductionTokenizer:
         Returns:
             bytes: Byte sequence corresponding to token_id, or default placeholder if not found.
         """
-        # TODO: Retrieve byte mapping from vocabulary dictionary for specified token_id
-        raise NotImplementedError("Implement this method")
+        return self.vocab.get(token_id, b"")
 
 
 # [KEEP_IMPLEMENTATION]

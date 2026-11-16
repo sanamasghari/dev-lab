@@ -17,8 +17,17 @@ def clean_text(text: str) -> str:
     Returns:
         str: Cleaned and normalized text string.
     """
-    # TODO: Strip unwanted markup, non-ASCII noise, and normalize spaces/newlines.
-    raise NotImplementedError("Implement this method")
+    if not text:
+        return ""
+    # Remove HTML tags
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Remove URLs
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text)
+    # Strip non-ASCII characters
+    text = text.encode("ascii", errors="ignore").decode("ascii")
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 
 def quality_filter(
@@ -39,8 +48,21 @@ def quality_filter(
     Returns:
         bool: True if the document meets quality criteria, False otherwise.
     """
-    # TODO: Check word count thresholds and measure capitalization and special-character ratios.
-    raise NotImplementedError("Implement this method")
+    if not text:
+        return False
+    words = text.split()
+    if len(words) < min_words:
+        return False
+
+    caps_words = sum(1 for w in words if w.isupper() and any(c.isalpha() for c in w))
+    if (caps_words / len(words)) > max_ratio_caps:
+        return False
+
+    special_chars = sum(1 for c in text if not c.isalnum() and not c.isspace())
+    if (special_chars / len(text)) > max_ratio_special:
+        return False
+
+    return True
 
 
 def get_shingles(text: str, k: int = 5) -> Set[str]:
@@ -54,8 +76,10 @@ def get_shingles(text: str, k: int = 5) -> Set[str]:
     Returns:
         Set[str]: Unique set of k-word shingles.
     """
-    # TODO: Lowercase, tokenize into words, and construct word n-gram shingles.
-    raise NotImplementedError("Implement this method")
+    words = re.findall(r"\w+", text.lower())
+    if len(words) < k or k <= 0:
+        return set()
+    return {" ".join(words[i : i + k]) for i in range(len(words) - k + 1)}
 
 
 def minhash_signature(shingles: Set[str], num_hashes: int = 128) -> List[int]:
@@ -69,8 +93,29 @@ def minhash_signature(shingles: Set[str], num_hashes: int = 128) -> List[int]:
     Returns:
         List[int]: MinHash signature list of length (num_hashes,).
     """
-    # TODO: Generate hash permutations for each seed and compute the minimum hash value per seed.
-    raise NotImplementedError("Implement this method")
+    if not shingles:
+        return [0] * num_hashes
+
+    prime = (1 << 61) - 1
+    max_hash = (1 << 32) - 1
+
+    base_hashes = [
+        int.from_bytes(hashlib.md5(s.encode("utf-8")).digest()[:4], "big")
+        for s in shingles
+    ]
+
+    rng = random.Random(42)
+    coeffs = [
+        (rng.randint(1, prime - 1), rng.randint(0, prime - 1))
+        for _ in range(num_hashes)
+    ]
+
+    signature: List[int] = []
+    for a, b in coeffs:
+        min_h = min(((a * h + b) % prime) & max_hash for h in base_hashes)
+        signature.append(min_h)
+
+    return signature
 
 
 def lsh_buckets(signature: List[int], bands: int = 16) -> List[Tuple[int, str]]:
@@ -84,8 +129,16 @@ def lsh_buckets(signature: List[int], bands: int = 16) -> List[Tuple[int, str]]:
     Returns:
         List[Tuple[int, str]]: List of (band_id, bucket_hash) tuples of length (bands,).
     """
-    # TODO: Slice signature into bands, hash each band chunk, and map to bucket identifiers.
-    raise NotImplementedError("Implement this method")
+    rows_per_band = len(signature) // bands
+    buckets: List[Tuple[int, str]] = []
+    for b in range(bands):
+        start = b * rows_per_band
+        end = len(signature) if b == bands - 1 else start + rows_per_band
+        band_slice = signature[start:end]
+        band_bytes = ",".join(map(str, band_slice)).encode("utf-8")
+        bucket_hash = hashlib.md5(band_bytes).hexdigest()
+        buckets.append((b, bucket_hash))
+    return buckets
 
 
 def deduplicate(
@@ -106,9 +159,48 @@ def deduplicate(
     Returns:
         Tuple[List[str], int]: Tuple containing (list of deduplicated documents, count of removed duplicates).
     """
-    # TODO: Build MinHash signatures and map documents into LSH band buckets.
-    # TODO: Collect candidate pairs from shared buckets, verify Jaccard similarity, and prune duplicates.
-    raise NotImplementedError("Implement this method")
+    if len(documents) <= 1:
+        return list(documents), 0
+
+    doc_shingles: List[Set[str]] = []
+    for doc in documents:
+        sh = get_shingles(doc, k=5)
+        if not sh:
+            sh = get_shingles(doc, k=1)
+        doc_shingles.append(sh)
+
+    signatures = [minhash_signature(sh, num_hashes=num_hashes) for sh in doc_shingles]
+
+    bucket_map: Dict[Tuple[int, str], List[int]] = defaultdict(list)
+    for doc_idx, sig in enumerate(signatures):
+        for band_bucket in lsh_buckets(sig, bands=bands):
+            bucket_map[band_bucket].append(doc_idx)
+
+    candidate_pairs: Set[Tuple[int, int]] = set()
+    for indices in bucket_map.values():
+        if len(indices) > 1:
+            for i in range(len(indices)):
+                for j in range(i + 1, len(indices)):
+                    u, v = indices[i], indices[j]
+                    candidate_pairs.add((min(u, v), max(u, v)))
+
+    removed_indices: Set[int] = set()
+    for i, j in sorted(candidate_pairs):
+        if i in removed_indices or j in removed_indices:
+            continue
+        sh_i, sh_j = doc_shingles[i], doc_shingles[j]
+        if not sh_i and not sh_j:
+            sim = 1.0 if documents[i] == documents[j] else 0.0
+        else:
+            union_len = len(sh_i | sh_j)
+            sim = len(sh_i & sh_j) / union_len if union_len > 0 else 0.0
+        if sim >= threshold:
+            removed_indices.add(j)
+
+    deduped_docs = [
+        doc for idx, doc in enumerate(documents) if idx not in removed_indices
+    ]
+    return deduped_docs, len(removed_indices)
 
 
 class SimpleTokenizer:
@@ -128,6 +220,22 @@ class SimpleTokenizer:
         self.eos_id: Optional[int] = None
         self.pad_id: int = 0
 
+    def _merge_pair(
+        self, tokens: List[int], pair: Tuple[int, int], new_id: int
+    ) -> List[int]:
+        merged: List[int] = []
+        i = 0
+        n = len(tokens)
+        p0, p1 = pair
+        while i < n:
+            if i < n - 1 and tokens[i] == p0 and tokens[i + 1] == p1:
+                merged.append(new_id)
+                i += 2
+            else:
+                merged.append(tokens[i])
+                i += 1
+        return merged
+    
     def train_bpe(self, text: str, num_merges: int) -> None:
         """
         Iteratively finds the most frequent pair of tokens and merges them into a new token.
@@ -139,10 +247,23 @@ class SimpleTokenizer:
         Returns:
             None
         """
-        # TODO: Convert text to raw byte tokens and iteratively identify most frequent token pairs.
-        # TODO: Register new merged tokens into vocabulary and replace occurrences in token stream.
-        # TODO: Assign specialized End-of-Sequence (EOS) token ID.
-        pass
+        tokens = list(text.encode("utf-8"))
+        for _ in range(num_merges):
+            if len(tokens) < 2:
+                break
+            pairs = Counter(zip(tokens, tokens[1:]))
+            if not pairs:
+                break
+            best_pair = max(pairs, key=lambda p: pairs[p])
+            new_id = self.next_id
+            self.next_id += 1
+            self.merges[best_pair] = new_id
+            self.vocab[new_id] = self.vocab[best_pair[0]] + self.vocab[best_pair[1]]
+            tokens = self._merge_pair(tokens, best_pair, new_id)
+
+        self.eos_id = self.next_id
+        self.vocab[self.eos_id] = b"<|eos|>"
+        self.next_id += 1
 
     def encode(self, text: str) -> List[int]:
         """
@@ -154,8 +275,14 @@ class SimpleTokenizer:
         Returns:
             List[int]: Encoded list of token IDs.
         """
-        # TODO: Convert input text to byte IDs and sequentially apply learned BPE merge rules.
-        raise NotImplementedError("Implement this method")
+        if not text:
+            return []
+        tokens = list(text.encode("utf-8"))
+        for pair, new_id in self.merges.items():
+            if len(tokens) < 2:
+                break
+            tokens = self._merge_pair(tokens, pair, new_id)
+        return tokens
 
     def decode(self, ids: List[int]) -> str:
         """
@@ -167,8 +294,13 @@ class SimpleTokenizer:
         Returns:
             str: Decoded text representation.
         """
-        # TODO: Reconstruct byte sequence from token IDs, skipping special tokens, and decode to UTF-8 text.
-        raise NotImplementedError("Implement this method")
+        byte_chunks: List[bytes] = []
+        for tid in ids:
+            if tid == self.eos_id:
+                continue
+            if tid in self.vocab:
+                byte_chunks.append(self.vocab[tid])
+        return b"".join(byte_chunks).decode("utf-8", errors="replace")
 
     def vocab_size(self) -> int:
         """
@@ -177,8 +309,7 @@ class SimpleTokenizer:
         Returns:
             int: Total vocabulary size.
         """
-        # TODO: Return total number of active entries in vocabulary.
-        raise NotImplementedError("Implement this method")
+        return len(self.vocab)
 
 
 def tokenize_corpus(documents: List[str], tokenizer: SimpleTokenizer) -> List[int]:
@@ -192,8 +323,16 @@ def tokenize_corpus(documents: List[str], tokenizer: SimpleTokenizer) -> List[in
     Returns:
         List[int]: Flat list containing combined token sequence.
     """
-    # TODO: Tokenize individual documents, append EOS markers, and flatten into a continuous sequence.
-    raise NotImplementedError("Implement this method")
+    if tokenizer.eos_id is None:
+        tokenizer.eos_id = tokenizer.next_id
+        tokenizer.vocab[tokenizer.eos_id] = b"<|eos|>"
+        tokenizer.next_id += 1
+
+    flat_tokens: List[int] = []
+    for doc in documents:
+        flat_tokens.extend(tokenizer.encode(doc))
+        flat_tokens.append(tokenizer.eos_id)
+    return flat_tokens
 
 
 def pack_sequences(
@@ -213,9 +352,20 @@ def pack_sequences(
         Tuple[List[List[int]], List[List[int]]]: Tuple of (padded_sequences, attention_masks)
             where each element has dynamic batch outer dimension and sequence shape (seq_length,).
     """
-    # TODO: Chunk continuous token IDs into uniform blocks of fixed sequence length.
-    # TODO: Apply padding to trailing sequence blocks and generate binary attention mask indicators.
-    raise NotImplementedError("Implement this method")
+    if not token_ids or seq_length <= 0:
+        return [], []
+
+    sequences: List[List[int]] = []
+    masks: List[List[int]] = []
+
+    for i in range(0, len(token_ids), seq_length):
+        chunk = token_ids[i : i + seq_length]
+        valid_len = len(chunk)
+        pad_len = seq_length - valid_len
+        sequences.append(chunk + [pad_id] * pad_len)
+        masks.append([1] * valid_len + [0] * pad_len)
+
+    return sequences, masks
 
 
 class PreTrainingDataLoader:
@@ -250,8 +400,9 @@ class PreTrainingDataLoader:
         Returns:
             int: Number of available mini-batches.
         """
-        # TODO: Compute total batch count accounting for ceiling division of sequence length.
-        raise NotImplementedError("Implement this method")
+        if not self.sequences or self.batch_size <= 0:
+            return 0
+        return (len(self.sequences) + self.batch_size - 1) // self.batch_size
 
     def __iter__(self) -> Generator[Tuple[List[List[int]], List[List[int]]], None, None]:
         """
@@ -261,8 +412,15 @@ class PreTrainingDataLoader:
             Generator[Tuple[List[List[int]], List[List[int]]], None, None]: Batch generator yielding 
             (batch_sequences, batch_attention_masks) where each tensor component has shape (batch_size, seq_length).
         """
-        # TODO: Shuffle document indices conditionally, iterate in mini-batch strides, and yield batch slices.
-        raise NotImplementedError("Implement this method")
+        indices = list(range(len(self.sequences)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        for i in range(0, len(indices), self.batch_size):
+            batch_idx = indices[i : i + self.batch_size]
+            batch_seqs = [self.sequences[idx] for idx in batch_idx]
+            batch_masks = [self.attention_masks[idx] for idx in batch_idx]
+            yield batch_seqs, batch_masks
 
 
 def compute_statistics(
@@ -283,9 +441,36 @@ def compute_statistics(
     Returns:
         Dict[str, Any]: Dictionary containing pre-training dataset analytical statistics.
     """
-    # TODO: Measure total corpus dimensions, compute character-to-token compression, and track document lengths.
-    # TODO: Calculate top token frequencies, sequence padding efficiency ratios, and vocabulary utilization.
-    raise NotImplementedError("Implement this method")
+    total_docs = len(documents)
+    total_chars = sum(len(doc) for doc in documents)
+    total_words = sum(len(doc.split()) for doc in documents)
+    total_tokens = len(token_ids)
+    unique_tokens = len(set(token_ids))
+
+    vocab_utilization = (
+        unique_tokens / tokenizer_vocab_size if tokenizer_vocab_size > 0 else 0.0
+    )
+    compression_ratio = total_chars / total_tokens if total_tokens > 0 else 0.0
+    avg_doc_length_words = total_words / total_docs if total_docs > 0 else 0.0
+
+    num_sequences = len(sequences)
+    total_capacity = sum(len(seq) for seq in sequences)
+    sequence_utilization = (
+        min(1.0, total_tokens / total_capacity) if total_capacity > 0 else 0.0
+    )
+
+    return {
+        "total_documents": total_docs,
+        "total_characters": total_chars,
+        "total_tokens": total_tokens,
+        "unique_tokens": unique_tokens,
+        "vocab_utilization": vocab_utilization,
+        "compression_ratio": compression_ratio,
+        "avg_doc_length_words": avg_doc_length_words,
+        "num_sequences": num_sequences,
+        "sequence_utilization": sequence_utilization,
+        "top_tokens": Counter(token_ids).most_common(10),
+    }
 
 
 # [KEEP_IMPLEMENTATION]

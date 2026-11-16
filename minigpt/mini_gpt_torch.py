@@ -23,6 +23,7 @@ torch.long. Do not hardcode dtypes or devices inside forward passes: derive them
 the incoming tensors, so the same code runs unchanged in float64.
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -60,7 +61,11 @@ class Embedding(nn.Module):
                 positions 0..seq_len-1, broadcast across the batch.
                 Shape: (batch_size, seq_len, embed_dim)
         """
-        raise NotImplementedError("Implement this method")
+        seq_len = token_ids.shape[1]
+        positions = torch.arange(seq_len, dtype=torch.long, device=token_ids.device)
+        tok_emb = self.token_embed(token_ids)
+        pos_emb = self.pos_embed(positions)
+        return tok_emb + pos_emb
 
 
 class LayerNorm(nn.Module):
@@ -95,7 +100,10 @@ class LayerNorm(nn.Module):
                 The mean and the biased variance are computed over the last axis only.
                 Shape: (..., dim)
         """
-        raise NotImplementedError("Implement this method")
+        mean = x.mean(dim=-1, keepdim=True)
+        var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        return self.gamma * x_norm + self.beta
 
 
 class MultiHeadAttention(nn.Module):
@@ -145,7 +153,24 @@ class MultiHeadAttention(nn.Module):
                 through W_out.
                 Shape: (batch_size, seq_len, embed_dim)
         """
-        raise NotImplementedError("Implement this method")
+        batch_size, seq_len, embed_dim = x.shape
+
+        q = self.W_q(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask
+
+        # Numerically stable manual softmax over the last dimension
+        scores_max = scores.max(dim=-1, keepdim=True).values
+        exp_scores = torch.exp(scores - scores_max)
+        attn_weights = exp_scores / exp_scores.sum(dim=-1, keepdim=True)
+
+        context = torch.matmul(attn_weights, v)
+        context = context.transpose(1, 2).contiguous().view(batch_size, seq_len, embed_dim)
+        return self.W_out(context)
 
 
 class FeedForward(nn.Module):
@@ -180,7 +205,8 @@ class FeedForward(nn.Module):
             torch.Tensor: Transformed features, projected up to ff_dim and back down.
                 Shape: (..., embed_dim)
         """
-        raise NotImplementedError("Implement this method")
+        hidden = torch.clamp(self.fc1(x), min=0.0)
+        return self.fc2(hidden)
 
 
 class TransformerBlock(nn.Module):
@@ -220,7 +246,9 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output representation with the same shape as the input.
                 Shape: (batch_size, seq_len, embed_dim)
         """
-        raise NotImplementedError("Implement this method")
+        x = x + self.attn(self.ln1(x), mask=mask)
+        x = x + self.ffn(self.ln2(x))
+        return x
 
 
 def causal_mask(seq_len, dtype=torch.float32, device=None):
@@ -239,7 +267,12 @@ def causal_mask(seq_len, dtype=torch.float32, device=None):
             the mask stays valid in float64.
             Shape: (seq_len, seq_len)
     """
-    raise NotImplementedError("Implement this function")
+    mask = torch.zeros((seq_len, seq_len), dtype=dtype, device=device)
+    upper_tri = torch.triu(
+        torch.ones((seq_len, seq_len), dtype=torch.bool, device=device), diagonal=1
+    )
+    mask = mask.masked_fill(upper_tri, torch.finfo(dtype).min)
+    return mask
 
 
 class MiniGPT(nn.Module):
@@ -289,7 +322,14 @@ class MiniGPT(nn.Module):
                 `seq_len` must prevent every position from attending to later positions.
                 Shape: (batch_size, seq_len, vocab_size)
         """
-        raise NotImplementedError("Implement this method")
+        seq_len = token_ids.shape[1]
+        x = self.embedding(token_ids)
+        mask = causal_mask(seq_len, dtype=x.dtype, device=x.device)
+        for block in self.blocks:
+            x = block(x, mask=mask)
+        x = self.ln_f(x)
+        logits = torch.matmul(x, self.embedding.token_embed.weight.transpose(0, 1))
+        return logits
 
     def count_parameters(self):
         """
@@ -304,7 +344,21 @@ class MiniGPT(nn.Module):
         Returns:
             int: Grand total parameter count across all components.
         """
-        raise NotImplementedError("Implement this method")
+        vocab = self.vocab_size
+        dim = self.embed_dim
+        seq_len = self.max_seq_len
+        num_layers = len(self.blocks)
+        ff_dim = self.blocks[0].ffn.fc1.out_features if num_layers > 0 else 4 * dim
+
+        token_emb = vocab * dim
+        pos_emb = seq_len * dim
+        per_block_attn = 4 * (dim * dim)
+        per_block_ffn = (dim * ff_dim + ff_dim) + (ff_dim * dim + dim)
+        per_block_ln = 4 * dim
+        per_block = per_block_attn + per_block_ffn + per_block_ln
+        final_ln = 2 * dim
+
+        return token_emb + pos_emb + num_layers * per_block + final_ln
 
 
 def cross_entropy_loss(logits, targets):
@@ -326,7 +380,13 @@ def cross_entropy_loss(logits, targets):
             batch_size * seq_len positions.
             Shape: ()
     """
-    raise NotImplementedError("Implement this function")
+    max_logits = logits.max(dim=-1, keepdim=True).values
+    shifted = logits - max_logits
+    log_sum_exp = torch.log(torch.exp(shifted).sum(dim=-1, keepdim=True))
+    log_probs = shifted - log_sum_exp
+
+    target_log_probs = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+    return -target_log_probs.mean()
 
 
 def generate(model, prompt_tokens, max_new_tokens=100, temperature=0.8):
@@ -348,7 +408,24 @@ def generate(model, prompt_tokens, max_new_tokens=100, temperature=0.8):
             len(prompt_tokens) + max_new_tokens. The context fed to the model at each
             step must be truncated to the model's maximum sequence length.
     """
-    raise NotImplementedError("Implement this function")
+    generated = list(prompt_tokens)
+    device = model.embedding.token_embed.weight.device
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            context = generated[-model.max_seq_len :]
+            input_ids = torch.tensor([context], dtype=torch.long, device=device)
+            logits = model(input_ids)
+            next_logits = logits[0, -1, :] / temperature
+
+            max_val = next_logits.max(dim=-1, keepdim=True).values
+            exp_logits = torch.exp(next_logits - max_val)
+            probs = exp_logits / exp_logits.sum(dim=-1, keepdim=True)
+
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated.append(int(next_token.view(-1)[0]))
+
+    return generated
 
 
 def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
@@ -384,7 +461,40 @@ def train_mini_gpt(text, vocab_size=256, embed_dim=128, num_heads=4,
     Returns:
         MiniGPT: The trained model instance, left in eval mode.
     """
-    raise NotImplementedError("Implement this function")
+    raw_bytes = list(text.encode("utf-8"))
+    if len(raw_bytes) <= seq_len + 1:
+        raw_bytes = raw_bytes * ((seq_len + 2) // max(len(raw_bytes), 1) + 1)
+
+    data = torch.tensor(raw_bytes, dtype=torch.long)
+    model = MiniGPT(
+        vocab_size=vocab_size,
+        embed_dim=embed_dim,
+        num_heads=num_heads,
+        num_layers=num_layers,
+        max_seq_len=seq_len,
+        ff_dim=4 * embed_dim,
+    )
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    max_start = len(data) - seq_len - 1
+    for step in range(1, num_steps + 1):
+        starts = torch.randint(0, max_start + 1, (batch_size,))
+        offsets = torch.arange(seq_len)
+        inputs = data[starts.unsqueeze(1) + offsets]
+        targets = data[starts.unsqueeze(1) + offsets + 1]
+
+        optimizer.zero_grad()
+        logits = model(inputs)
+        loss = cross_entropy_loss(logits, targets)
+        loss.backward()
+        optimizer.step()
+
+        if step % 20 == 0 or step == 1:
+            print(f"Step {step:4d}/{num_steps} | Loss: {loss.item():.4f}")
+
+    model.eval()
+    return model
 
 
 def parameter_breakdown():
